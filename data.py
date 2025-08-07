@@ -10,11 +10,18 @@ class LOBDataset(Dataset):
     每条样本由 (df_id, k) 唯一确定，其中 k 是各自 df 的行号。
     """
 
-    def __init__(self, data, data_cfg: dict):
+    def __init__(
+        self,
+        data: List[pd.DataFrame],
+        task_type: str,
+        data_cfg: dict,
+    ):
         super().__init__()
+        self.task_type = task_type
         self.seq_len = data_cfg["seq_len"]
         self.horizon = data_cfg["horizon"]
         self.alpha = data_cfg["alpha"]
+        self.multiplier = data_cfg["multiplier"]
         self.features = data_cfg["feature_order"]
         self.use_rolling_mean = data_cfg["use_rolling_mean"]
 
@@ -49,44 +56,52 @@ class LOBDataset(Dataset):
             past = mid_arr[k]
             future = mid_arr[k + self.horizon]
 
-        pct = (future - past) / past
-        label = 2 if pct > self.alpha else (0 if pct < -self.alpha else 1)
-
-        return torch.from_numpy(x_window), torch.tensor(label, dtype=torch.long)
+        label = (future - past) / past * self.multiplier
+        
+        if self.task_type == "regression":
+            return torch.from_numpy(x_window), torch.tensor(label, dtype=torch.float32)
+        elif self.task_type == "classification":
+            label = 2 if label > self.alpha else (0 if label < -self.alpha else 1)
+            return torch.from_numpy(x_window), torch.tensor(label, dtype=torch.long)
+        else:
+            raise NotImplementedError(f"{self.task_type} is not support.")
 
 
 class LOBDataModule(pl.LightningDataModule):
     def __init__(
         self,
-        data: Union[pd.DataFrame, List[pd.DataFrame]],
-        batch: int,
-        val_ratio: float,
+        train_data: Union[pd.DataFrame, List[pd.DataFrame]],
+        test_data: Union[pd.DataFrame, List[pd.DataFrame]],
+        dm_cfg: dict,
         data_cfg: dict,
-        random_split: bool = False,
-        num_workers: int = 4,
+        task_type: str
     ):
         super().__init__()
-        self.data, self.batch, self.val_ratio = data, batch, val_ratio
+
+        self.batch = dm_cfg["batch_size"]
+        self.val_ratio = dm_cfg["val_ratio"]
+        self.random_split = dm_cfg.get("random_split", False)
+        self.num_workers = dm_cfg.get("num_workers", 4)
+        self.task_type = task_type
+
+        self.train_data, self.test_data = train_data, test_data
         self.data_cfg = data_cfg
-        self.random_split = random_split
-        self.num_workers = num_workers
 
     def setup(self, stage=None):
-        ds = LOBDataset(self.data, self.data_cfg)
-
-        if self.random_split:
-            n_val = int(len(ds) * self.val_ratio)
-            self.train_set, self.val_set = torch.utils.data.random_split(
-                ds, [len(ds) - n_val, n_val]
-            )
-        else:
-            n = len(ds)
-            n_val = int(n * self.val_ratio)
-            train_indices = list(range(0, n - n_val))
-            val_indices = list(range(n - n_val, n))
-
-            self.train_set = Subset(ds, train_indices)
-            self.val_set = Subset(ds, val_indices)
+        if stage in (None, "fit"):
+            full_ds = LOBDataset(self.train_data, self.task_type, self.data_cfg)
+            if self.random_split:
+                n_val = int(len(full_ds) * self.val_ratio)
+                self.train_set, self.val_set = torch.utils.data.random_split(
+                    full_ds, [len(full_ds) - n_val, n_val]
+                )
+            else:
+                n = len(full_ds)
+                n_val = int(n * self.val_ratio)
+                self.train_set = Subset(full_ds, list(range(0, n - n_val)))
+                self.val_set = Subset(full_ds, list(range(n - n_val, n)))
+        if stage in (None, "test"):
+            self.test_set = LOBDataset(self.test_data, self.task_type, self.data_cfg)
 
     def train_dataloader(self):
         return DataLoader(
@@ -103,4 +118,13 @@ class LOBDataModule(pl.LightningDataModule):
             batch_size=self.batch,
             num_workers=self.num_workers,
             persistent_workers=True,
+        )
+
+    def test_dataloader(self):
+        return DataLoader(
+            self.test_set,
+            batch_size=self.batch,
+            shuffle=False,
+            persistent_workers=True,
+            num_workers=self.num_workers,
         )

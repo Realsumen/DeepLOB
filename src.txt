@@ -1,5 +1,383 @@
 ================================================================================
-File: .\data.py
+File: ./utility.py
+--------------------------------------------------------------------------------
+import random, torch, os, numpy as np
+
+def set_random_seed(seed: int = 42):
+    """
+    固定全局随机数种子，确保实验可复现。
+
+    Args:
+        seed (int): 随机数种子，默认42。
+    """
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+================================================================================
+File: ./model.py
+--------------------------------------------------------------------------------
+import torch.nn as nn, torch, pytorch_lightning as pl
+import torch.nn.functional as F
+
+
+class DeepLOBLightning(pl.LightningModule):
+    def __init__(
+        self,
+        input_width,
+        input_size,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride,
+        lr,
+        neg_slope,
+        hidden_size,
+        lr_reduce_patience,
+        task_type,
+        monitor_metric,
+        mode
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.act = nn.LeakyReLU(self.hparams.neg_slope)
+
+        self.conv1 = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+        )  # -> (B,16,100,input_width // 2)
+        self.conv2 = nn.Conv2d(
+            out_channels, out_channels, kernel_size, stride=stride
+        )  # -> (B,16,100,input_width // 4)
+        self.conv3 = nn.Conv2d(
+            out_channels, out_channels, kernel_size=(1, self.hparams.input_width // 4)
+        )  # -> (B,16,100,1)
+
+        # Inception 分支
+        def branch(k):  # k x 1 卷积分支
+            return nn.Sequential(
+                nn.Conv2d(16, 8, (1, 1)),
+                nn.Conv2d(8, 8, (k, 1), padding="same"),
+                self.act,
+            )
+
+        self.branch1 = nn.Conv2d(16, 8, (1, 1))
+        self.branch3, self.branch10, self.branch20 = branch(3), branch(10), branch(20)
+        self.branchP = nn.Sequential(
+            nn.MaxPool2d((3, 1), 1, (1, 0)), nn.Conv2d(16, 8, (1, 1))
+        )
+
+        self.lstm = nn.LSTM(
+            input_size=input_size, hidden_size=hidden_size, batch_first=True
+        )
+
+        if task_type == "classification":
+            self.out_dim = 3
+            self.loss_fn = nn.CrossEntropyLoss()
+        elif task_type == "regression":
+            self.out_dim = 1
+            self.loss_fn = nn.MSELoss()
+        else:
+            raise ValueError(f"Unknown task_type: {task_type}")
+
+        self.fc = nn.Linear(hidden_size, self.out_dim)
+        self.apply(self._init_weights)
+        self.loss = nn.CrossEntropyLoss()
+
+    def _init_weights(self, m):
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            nn.init.kaiming_uniform_(
+                m.weight,
+                a=self.hparams.neg_slope if hasattr(self.hparams, "neg_slope") else 0,
+                nonlinearity="leaky_relu",
+            )
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):  # x (B,100,40)
+        x = x.unsqueeze(1)  # -> (B,1,100,40)
+        x = self.act(self.conv1(x))
+        x = self.act(self.conv2(x))
+        x = self.act(self.conv3(x))  # (B,16,100,1)
+
+        B, C, T, W = x.shape  # W=1
+        b1 = self.act(self.branch1(x))
+        b3 = self.branch3(x)
+        b10 = self.branch10(x)
+        b20 = self.branch20(x)
+        bp = self.act(self.branchP(x))
+        x = torch.cat([b1, b3, b10, b20, bp], dim=1)  # (B,40,100,1)
+        x = x.squeeze(-1).permute(0, 2, 1)  # (B,40,100)
+
+        lstm_out, _ = self.lstm(x)  # (100,B,64)
+        logits = self.fc(lstm_out[:, -1, :])  # (B, out_dim)
+        return logits
+
+    def training_step(self, batch, batch_idx):
+        X, y = batch
+        preds = self(X)
+        if self.hparams.task_type == "classification":
+            loss = self.loss_fn(preds, y)
+        else:
+            loss = self.loss_fn(preds.squeeze(-1), y.float())
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        lr = self.trainer.optimizers[0].param_groups[0]["lr"]
+        self.log("lr", lr, on_step=True, on_epoch=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        X, y = batch
+        preds = self(X)
+        if self.hparams.task_type == "classification":
+            acc = (preds.argmax(dim=1) == y).float().mean()
+            self.log("val_acc", acc, on_step=False, on_epoch=True, prog_bar=True)
+        else:
+            preds = preds.squeeze(-1)
+            labels = y.float()
+            mse = F.mse_loss(preds.squeeze(-1), y.float())
+            ic = torch.corrcoef(torch.stack([preds, labels], dim=0))[0, 1]
+            self.log("val_mse", mse, on_step=False, on_epoch=True, prog_bar=True)
+            self.log("val_ic",  ic,  on_step=False, on_epoch=True, prog_bar=True)
+
+    def configure_optimizers(self):
+
+        optimizer = torch.optim.AdamW(
+            self.parameters(), lr=self.hparams.lr, weight_decay=1e-4
+        )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode=self.hparams.mode,
+            factor=0.5,
+            patience=self.hparams.lr_reduce_patience,
+            min_lr=1e-6,
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": self.hparams.monitor_metric,  # 以 validation accuracy 为触发指标
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
+
+
+================================================================================
+File: ./train.py
+--------------------------------------------------------------------------------
+# %%
+import pandas as pd, torch, pytorch_lightning as pl
+from pathlib import Path
+from typing import Tuple, List
+import yaml
+import re
+from pathlib import Path
+import torch.nn as nn
+from pytorch_lightning import Trainer
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+from pytorch_lightning.loggers import TensorBoardLogger
+
+from data import LOBDataModule
+from model import *
+from utility import *
+from eval import *
+
+
+def _cast_sci(obj):
+    """
+    递归把符合科学计数法格式的 str 转为 float
+    """
+    _sci_re = re.compile(
+        r"""^[+-]?            # 可选正负号
+            (?:\d+\.\d*|\d*\.\d+|\d+)  # 整数或小数
+            [eE][+-]?\d+$    # e/E + 指数
+        """,
+        re.VERBOSE,
+    )
+
+    if isinstance(obj, dict):
+        return {k: _cast_sci(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_cast_sci(v) for v in obj]
+    if isinstance(obj, str) and _sci_re.match(obj):
+        return float(obj)
+    return obj
+
+
+with open("config/config.yaml", encoding="utf-8") as f:
+    cfg = yaml.safe_load(f)
+
+cfg = _cast_sci(cfg)
+
+model_cfg = cfg["model"]
+ckpt_cfg = cfg["checkpoint"]
+trainer_cfg = cfg["trainer"]
+
+set_random_seed(cfg["seed"])
+
+data_path = Path(cfg["data"]["path"])
+files = cfg["data"]["parquet_file"]
+if isinstance(files, str):
+    data = pd.read_parquet(data_path / files)
+elif isinstance(files, list):
+    data = [pd.read_parquet(data_path / f) for f in files]
+else:
+    raise ValueError("cfg['data']['parquet_file'] 应该是 str 或 list[str]")
+
+dm = LOBDataModule(
+    train_data=data[:-1],
+    test_data=data[-1],
+    dm_cfg=cfg["datamodule"],
+    data_cfg=cfg["data"],
+    task_type=model_cfg["task_type"],
+)
+dm.setup()
+
+monitor_metric = model_cfg["monitor_metric"]
+mode = model_cfg["mode"]
+
+model = DeepLOBLightning(
+    input_width=model_cfg["input_width"],
+    input_size=model_cfg["input_size"],
+    in_channels=model_cfg["in_channels"],
+    out_channels=model_cfg["out_channels"],
+    kernel_size=tuple(model_cfg["kernel_size"]),
+    stride=tuple(model_cfg["stride"]),
+    lr=model_cfg["lr"],
+    neg_slope=model_cfg["neg_slope"],
+    hidden_size=model_cfg["hidden_size"],
+    lr_reduce_patience=model_cfg["lr_reduce_patience"],
+    task_type=model_cfg["task_type"],
+    monitor_metric=monitor_metric,
+    mode=mode,
+)
+
+checkpoint_callback = ModelCheckpoint(
+    mode=mode,
+    monitor=monitor_metric,
+    dirpath=ckpt_cfg["dirpath"],
+    filename=ckpt_cfg["filename"],
+    save_top_k=ckpt_cfg["save_top_k"],
+)
+
+early_stop_callback = EarlyStopping(
+    mode=mode,
+    monitor=monitor_metric,
+    patience=cfg["early_stop"]["patience"],
+    verbose=True,
+)
+
+logger = TensorBoardLogger(
+    save_dir=cfg["logger"]["tensorboard"]["save_dir"],
+    name=cfg["logger"]["tensorboard"]["name"],
+)
+
+trainer = Trainer(
+    accelerator=trainer_cfg["accelerator"],
+    devices=trainer_cfg["devices"],
+    max_epochs=trainer_cfg["max_epochs"],
+    callbacks=[checkpoint_callback, early_stop_callback],
+    logger=logger,
+    log_every_n_steps=trainer_cfg["log_every_n_steps"],
+)
+
+trainer.fit(model, dm)
+
+
+
+================================================================================
+File: ./eval.py
+--------------------------------------------------------------------------------
+from sklearn.metrics import confusion_matrix, classification_report
+import pytorch_lightning as pl
+import torch
+import numpy as np
+from scipy.stats import pearsonr, spearmanr
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error
+from tqdm import tqdm
+
+
+def evaluate_model(
+    model: pl.LightningModule, datamodule: pl.LightningDataModule, dataset: str = "test"
+):
+    task_type = model.hparams.task_type
+    all_preds, all_labels = [], []
+    device = model.device if hasattr(model, "device") else torch.device("cpu")
+
+    if dataset == "test":
+        dataloader = datamodule.test_dataloader()
+    elif dataset == "val":
+        dataloader = datamodule.val_dataloader()
+    elif dataset == "train":
+        dataloader = datamodule.train_dataloader()
+    else:
+        raise RuntimeError("Invalid dataset")
+
+    with torch.no_grad():
+
+        for X, y in tqdm(dataloader):
+            X = X.to(device)
+            out = model(X)
+            if task_type == "classification":
+                preds = out.argmax(dim=1).cpu()
+                labels = y.long()  # 确保整型
+            else:
+                preds = out.squeeze(-1).cpu()        # (B,)
+                labels = y.float() 
+            all_preds.append(preds)
+            all_labels.append(y)
+
+    preds = torch.cat(all_preds).numpy()
+    labels = torch.cat(all_labels).numpy()
+    if task_type == "classification":
+
+        cm = confusion_matrix(labels, preds, labels=[0, 1, 2])
+        print("混淆矩阵 (行=真值, 列=预测)：")
+        print(cm)
+
+        print("\n分类报告：")
+        print(
+            classification_report(
+                labels,
+                preds,
+                labels=[0, 1, 2],
+                target_names=["跌", "平", "涨"],
+                digits=4,
+            )
+        )
+
+    elif task_type == "regression":
+
+        ic_pearson, _ = pearsonr(preds, labels)
+        ic_spearman, _ = spearmanr(preds, labels)
+
+        print(f"Pearson IC = {ic_pearson:.4f}")
+        print(f"Spearman IC = {ic_spearman:.4f}")
+
+        lr = LinearRegression(fit_intercept=False)
+        lr.fit(preds.reshape(-1, 1), labels)
+        r2_no_intercept = lr.score(preds.reshape(-1, 1), labels)
+        print(f"R^2 (no intercept, standard) = {r2_no_intercept:.4f}")
+
+        num = np.dot(preds, labels) ** 2
+        den = np.dot(preds, preds) * np.dot(labels, labels)
+        r2_formula = num / den
+        print(f"R^2 (no intercept, formula) = {r2_formula:.4f}")
+
+        mse = mean_squared_error(labels, preds)
+        print(f"MSE = {mse:.6f}")
+
+
+================================================================================
+File: ./data.py
 --------------------------------------------------------------------------------
 import numpy as np, torch.nn as nn, pandas as pd, torch, pytorch_lightning as pl
 from torch.utils.data import Dataset, DataLoader
@@ -13,11 +391,18 @@ class LOBDataset(Dataset):
     每条样本由 (df_id, k) 唯一确定，其中 k 是各自 df 的行号。
     """
 
-    def __init__(self, data, data_cfg: dict):
+    def __init__(
+        self,
+        data: List[pd.DataFrame],
+        task_type: str,
+        data_cfg: dict,
+    ):
         super().__init__()
+        self.task_type = task_type
         self.seq_len = data_cfg["seq_len"]
         self.horizon = data_cfg["horizon"]
         self.alpha = data_cfg["alpha"]
+        self.multiplier = data_cfg["multiplier"]
         self.features = data_cfg["feature_order"]
         self.use_rolling_mean = data_cfg["use_rolling_mean"]
 
@@ -52,44 +437,52 @@ class LOBDataset(Dataset):
             past = mid_arr[k]
             future = mid_arr[k + self.horizon]
 
-        pct = (future - past) / past
-        label = 2 if pct > self.alpha else (0 if pct < -self.alpha else 1)
-
-        return torch.from_numpy(x_window), torch.tensor(label, dtype=torch.long)
+        label = (future - past) / past * self.multiplier
+        
+        if self.task_type == "regression":
+            return torch.from_numpy(x_window), torch.tensor(label, dtype=torch.float32)
+        elif self.task_type == "classification":
+            label = 2 if label > self.alpha else (0 if label < -self.alpha else 1)
+            return torch.from_numpy(x_window), torch.tensor(label, dtype=torch.long)
+        else:
+            raise NotImplementedError(f"{self.task_type} is not support.")
 
 
 class LOBDataModule(pl.LightningDataModule):
     def __init__(
         self,
-        data: Union[pd.DataFrame, List[pd.DataFrame]],
-        batch: int,
-        val_ratio: float,
+        train_data: Union[pd.DataFrame, List[pd.DataFrame]],
+        test_data: Union[pd.DataFrame, List[pd.DataFrame]],
+        dm_cfg: dict,
         data_cfg: dict,
-        random_split: bool = False,
-        num_workers: int = 4,
+        task_type: str
     ):
         super().__init__()
-        self.data, self.batch, self.val_ratio = data, batch, val_ratio
+
+        self.batch = dm_cfg["batch_size"]
+        self.val_ratio = dm_cfg["val_ratio"]
+        self.random_split = dm_cfg.get("random_split", False)
+        self.num_workers = dm_cfg.get("num_workers", 4)
+        self.task_type = task_type
+
+        self.train_data, self.test_data = train_data, test_data
         self.data_cfg = data_cfg
-        self.random_split = random_split
-        self.num_workers = num_workers
 
     def setup(self, stage=None):
-        ds = LOBDataset(self.data, self.data_cfg)
-
-        if self.random_split:
-            n_val = int(len(ds) * self.val_ratio)
-            self.train_set, self.val_set = torch.utils.data.random_split(
-                ds, [len(ds) - n_val, n_val]
-            )
-        else:
-            n = len(ds)
-            n_val = int(n * self.val_ratio)
-            train_indices = list(range(0, n - n_val))
-            val_indices = list(range(n - n_val, n))
-
-            self.train_set = Subset(ds, train_indices)
-            self.val_set = Subset(ds, val_indices)
+        if stage in (None, "fit"):
+            full_ds = LOBDataset(self.train_data, self.task_type, self.data_cfg)
+            if self.random_split:
+                n_val = int(len(full_ds) * self.val_ratio)
+                self.train_set, self.val_set = torch.utils.data.random_split(
+                    full_ds, [len(full_ds) - n_val, n_val]
+                )
+            else:
+                n = len(full_ds)
+                n_val = int(n * self.val_ratio)
+                self.train_set = Subset(full_ds, list(range(0, n - n_val)))
+                self.val_set = Subset(full_ds, list(range(n - n_val, n)))
+        if stage in (None, "test"):
+            self.test_set = LOBDataset(self.test_data, self.task_type, self.data_cfg)
 
     def train_dataloader(self):
         return DataLoader(
@@ -108,301 +501,13 @@ class LOBDataModule(pl.LightningDataModule):
             persistent_workers=True,
         )
 
-
-================================================================================
-File: .\eval.py
---------------------------------------------------------------------------------
-from sklearn.metrics import confusion_matrix, classification_report
-import torch
-
-def evaluate_model_on_val(model: torch.nn.Module, datamodule: torch.utils.data.DataLoader):
-    
-    all_preds, all_labels = [], []
-    device = model.device if hasattr(model, "device") else torch.device("cpu")
-
-    with torch.no_grad():
-        for X, y in datamodule.val_dataloader():
-            X = X.to(device)
-            logits = model(X)
-            preds = logits.argmax(dim=1).cpu()
-            all_preds.append(preds)
-            all_labels.append(y)
-
-    preds  = torch.cat(all_preds).numpy()
-    labels = torch.cat(all_labels).numpy()
-
-    cm = confusion_matrix(labels, preds, labels=[0,1,2])
-    print("混淆矩阵 (行=真值, 列=预测)：")
-    print(cm)
-
-    print("\n分类报告：")
-    print(classification_report(
-        labels, preds,
-        labels=[0,1,2],
-        target_names=["跌", "平", "涨"],
-        digits=4
-    ))
-
-
-================================================================================
-File: .\model.py
---------------------------------------------------------------------------------
-import torch.nn as nn, torch, pytorch_lightning as pl
-
-class DeepLOBLightning(pl.LightningModule):
-    def __init__(
-        self,
-        input_width,
-        input_size,
-        in_channels,
-        out_channels,
-        kernel_size,
-        stride,
-        lr,
-        neg_slope,
-        hidden_size,
-        lr_reduce_patience
-    ):
-        super().__init__()
-        self.save_hyperparameters()
-        self.conv1 = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            stride=stride,
-        )  # -> (B,16,100,input_width // 2)
-        self.conv2 = nn.Conv2d(
-            out_channels, out_channels, kernel_size, stride=stride
-        )  # -> (B,16,100,input_width // 4)
-        self.conv3 = nn.Conv2d(
-            out_channels, out_channels, kernel_size=(1, self.hparams.input_width // 4)
-        )  # -> (B,16,100,1)
-        act = nn.LeakyReLU(0.01)
-
-        # Inception 分支
-        def branch(k):  # k x 1 卷积分支
-            return nn.Sequential(
-                nn.Conv2d(16, 8, (1, 1)),
-                nn.Conv2d(8, 8, (k, 1), padding="same"),
-                act,
-            )
-
-        self.branch1 = nn.Conv2d(16, 8, (1, 1))
-        self.branch3, self.branch10, self.branch20 = branch(3), branch(10), branch(20)
-        self.branchP = nn.Sequential(
-            nn.MaxPool2d((3, 1), 1, (1, 0)), nn.Conv2d(16, 8, (1, 1))
+    def test_dataloader(self):
+        return DataLoader(
+            self.test_set,
+            batch_size=self.batch,
+            shuffle=False,
+            persistent_workers=True,
+            num_workers=self.num_workers,
         )
 
-        self.lstm = nn.LSTM(
-            input_size=input_size, hidden_size=hidden_size, batch_first=True
-        )
-        self.fc = nn.Linear(hidden_size, 3)
-        self.apply(self._init_weights)
-        self.act = act
-        self.loss = nn.CrossEntropyLoss()
-
-    def _init_weights(self, m):
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
-            nn.init.kaiming_uniform_(
-                m.weight,
-                a=self.hparams.neg_slope if hasattr(self.hparams, 'neg_slope') else 0,
-                nonlinearity='leaky_relu'
-            )
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-
-    def forward(self, x):  # x (B,100,40)
-        x = x.unsqueeze(1)  # -> (B,1,100,40)
-        x = self.act(self.conv1(x))
-        x = self.act(self.conv2(x))
-        x = self.act(self.conv3(x))  # (B,16,100,1)
-
-        B, C, T, W = x.shape  # W=1
-        b1 = self.act(self.branch1(x))
-        b3 = self.branch3(x)
-        b10 = self.branch10(x)
-        b20 = self.branch20(x)
-        bp = self.act(self.branchP(x))
-        x = torch.cat([b1, b3, b10, b20, bp], dim=1)  # (B,40,100,1)
-        x = x.squeeze(-1).permute(0, 2, 1)  # (B,40,100)
-
-        lstm_out, _ = self.lstm(x)  # (100,B,64)
-        logits = self.fc(lstm_out[:, -1, :])  # 只取最后时刻
-        return logits
-
-    def training_step(self, batch, batch_idx):
-        X, y = batch
-        logits = self(X)
-        loss = self.loss(logits, y)
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        lr = self.trainer.optimizers[0].param_groups[0]['lr']
-        self.log('lr', lr, on_step=True, on_epoch=True)
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        X, y = batch
-        logits = self(X)
-        preds = logits.argmax(dim=1)
-        acc = (preds == y).float().mean()
-        self.log("val_acc", acc, on_step=False, on_epoch=True, prog_bar=True)
-        return acc  # 如果你想在 validation_epoch_end 里拿到所有 batch 的 acc
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=self.hparams.lr_reduce_patience, min_lr=1e-6)
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "val_acc",      # 以 validation accuracy 为触发指标
-                "interval": "epoch",
-                "frequency": 1,
-            },
-        }
-
-
-
-
-================================================================================
-File: .\train.py
---------------------------------------------------------------------------------
-# train.py
-import pandas as pd, torch, pytorch_lightning as pl
-from pathlib import Path
-from typing import Tuple, List
-import yaml
-import re
-from pathlib import Path
-import torch.nn as nn
-from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from pytorch_lightning.loggers import TensorBoardLogger
-
-from data import *
-from model import *
-from utility import *
-from eval import *
-
-
-def _cast_sci(obj):
-    """
-    递归把符合科学计数法格式的 str 转为 float
-    """
-    _sci_re = re.compile(
-        r"""^[+-]?            # 可选正负号
-            (?:\d+\.\d*|\d*\.\d+|\d+)  # 整数或小数
-            [eE][+-]?\d+$    # e/E + 指数
-        """,
-        re.VERBOSE,
-    )
-
-    if isinstance(obj, dict):
-        return {k: _cast_sci(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_cast_sci(v) for v in obj]
-    if isinstance(obj, str) and _sci_re.match(obj):
-        return float(obj)
-    return obj
-
-
-def train():
-
-    with open("config/config.yaml", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-
-    cfg = _cast_sci(cfg)
-
-    set_random_seed(cfg["seed"])
-
-    data_path = Path(cfg["data"]["path"])
-    files = cfg["data"]["parquet_file"]
-
-    if isinstance(files, str):
-        data = pd.read_parquet(data_path / files)
-    elif isinstance(files, list):
-        data = pd.concat(
-            [pd.read_parquet(data_path / f) for f in files], ignore_index=True
-        )
-    else:
-        raise ValueError("cfg['data']['parquet_file'] 应该是 str 或 list[str]")
-
-    dm = LOBDataModule(
-        data=data,
-        batch=cfg["datamodule"]["batch_size"],
-        val_ratio=cfg["datamodule"]["val_ratio"],
-        random_split=cfg["datamodule"]["random_split"],
-        data_cfg=cfg["data"],
-    )
-    dm.setup()
-
-    model = DeepLOBLightning(
-        input_width=cfg["model"]["input_width"],
-        input_size=cfg["model"]["input_size"],
-        in_channels=cfg["model"]["in_channels"],
-        out_channels=cfg["model"]["out_channels"],
-        kernel_size=tuple(cfg["model"]["kernel_size"]),
-        stride=tuple(cfg["model"]["stride"]),
-        lr=cfg["model"]["lr"],
-        neg_slope=cfg["model"]["neg_slope"],
-        hidden_size=cfg["model"]["hidden_size"],
-        lr_reduce_patience=cfg["model"]["lr_reduce_patience"]
-    )
-
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=cfg["checkpoint"]["dirpath"],
-        filename=cfg["checkpoint"]["filename"],
-        monitor=cfg["checkpoint"]["monitor"],
-        mode=cfg["checkpoint"]["mode"],
-        save_top_k=cfg["checkpoint"]["save_top_k"],
-    )
-
-    early_stop_callback = EarlyStopping(
-        monitor="val_acc",                          # 监控验证集准确率
-        patience=cfg["early_stop"]["patience"],     # 连续 多 个 epoch 无提升就停
-        mode="max",                                 # 准确率越大越好
-        verbose=True,
-    )
-
-    logger = TensorBoardLogger(
-        save_dir=cfg["logger"]["tensorboard"]["save_dir"],
-        name=cfg["logger"]["tensorboard"]["name"],
-    )
-
-    trainer = Trainer(
-        accelerator=cfg["trainer"]["accelerator"],
-        devices=cfg["trainer"]["devices"],
-        max_epochs=cfg["trainer"]["max_epochs"],
-        callbacks=[checkpoint_callback, early_stop_callback],
-        logger=logger,
-        log_every_n_steps=cfg["trainer"]["log_every_n_steps"],
-    )
-
-    trainer.fit(model, dm)
-
-    evaluate_model_on_val(model, dm)
-
-
-if __name__ == "__main__":
-    train()
-
-
-================================================================================
-File: .\utility.py
---------------------------------------------------------------------------------
-import random, torch, os, numpy as np
-
-def set_random_seed(seed: int = 42):
-    """
-    固定全局随机数种子，确保实验可复现。
-
-    Args:
-        seed (int): 随机数种子，默认42。
-    """
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
