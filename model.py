@@ -12,6 +12,7 @@ class DeepLOBLightning(pl.LightningModule):
         lr,
         neg_slope,
         hidden_size,
+        lr_reduce_patience
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -99,7 +100,7 @@ class DeepLOBLightning(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3, min_lr=1e-6)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=self.hparams.lr_reduce_patience, min_lr=1e-6)
         return {
             "optimizer": optimizer,
             "lr_scheduler": {

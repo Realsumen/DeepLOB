@@ -44,9 +44,10 @@ class LOBDataset(Dataset):
         x_window = X[k - self.seq_len : k]
         if self.use_rolling_mean:
             past = mid_arr[k - self.seq_len : k].mean()
+            future = mid_arr[k + 1 : k + 1 + self.horizon].mean()
         else:
             past = mid_arr[k]
-        future = mid_arr[k + 1 : k + 1 + self.horizon].mean()
+            future = mid_arr[k + self.horizon]
 
         pct = (future - past) / past
         label = 2 if pct > self.alpha else (0 if pct < -self.alpha else 1)

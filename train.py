@@ -36,9 +36,10 @@ def _cast_sci(obj):
         return float(obj)
     return obj
 
+
 def train():
 
-    with open("config/config.yaml", "r") as f:
+    with open("config/config.yaml", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     cfg = _cast_sci(cfg)
@@ -51,7 +52,9 @@ def train():
     if isinstance(files, str):
         data = pd.read_parquet(data_path / files)
     elif isinstance(files, list):
-        data = pd.concat([pd.read_parquet(data_path / f) for f in files], ignore_index=True)
+        data = pd.concat(
+            [pd.read_parquet(data_path / f) for f in files], ignore_index=True
+        )
     else:
         raise ValueError("cfg['data']['parquet_file'] 应该是 str 或 list[str]")
 
@@ -60,10 +63,9 @@ def train():
         batch=cfg["datamodule"]["batch_size"],
         val_ratio=cfg["datamodule"]["val_ratio"],
         random_split=cfg["datamodule"]["random_split"],
-        data_cfg=cfg["data"]
+        data_cfg=cfg["data"],
     )
     dm.setup()
-
 
     model = DeepLOBLightning(
         input_width=cfg["model"]["input_width"],
@@ -75,6 +77,7 @@ def train():
         lr=cfg["model"]["lr"],
         neg_slope=cfg["model"]["neg_slope"],
         hidden_size=cfg["model"]["hidden_size"],
+        lr_reduce_patience=cfg["model"]["lr_reduce_patience"]
     )
 
     checkpoint_callback = ModelCheckpoint(
@@ -84,11 +87,11 @@ def train():
         mode=cfg["checkpoint"]["mode"],
         save_top_k=cfg["checkpoint"]["save_top_k"],
     )
-    
+
     early_stop_callback = EarlyStopping(
-        monitor="val_acc",   # 监控验证集准确率
-        patience=5,          # 连续 5 个 epoch 无提升就停
-        mode="max",          # 准确率越大越好
+        monitor="val_acc",                          # 监控验证集准确率
+        patience=cfg["early_stop"]["patience"],     # 连续 多 个 epoch 无提升就停
+        mode="max",                                 # 准确率越大越好
         verbose=True,
     )
 
@@ -107,8 +110,9 @@ def train():
     )
 
     trainer.fit(model, dm)
-    
+
     evaluate_model_on_val(model, dm)
+
 
 if __name__ == "__main__":
     train()
