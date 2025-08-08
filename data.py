@@ -166,7 +166,7 @@ class LOBDataModule(pl.LightningDataModule):
         total_sq = np.zeros(F, np.float64)
         count = 0
         for df in frames:
-            arr = df[feats].ffill().dropna().to_numpy(np.float64)
+            arr = df[feats].ffill().bfill().dropna().to_numpy(np.float64)
             if arr.size == 0:
                 continue
             total += arr.sum(0, dtype=np.float64)
@@ -352,7 +352,7 @@ class LOBDataModule(pl.LightningDataModule):
             shuffle=True,
             num_workers=self.num_workers,
             persistent_workers=(self.num_workers > 0),
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
         )
 
     def val_dataloader(self):
@@ -362,7 +362,7 @@ class LOBDataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             persistent_workers=(self.num_workers > 0),
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
         )
 
     def test_dataloader(self):
@@ -372,5 +372,5 @@ class LOBDataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             persistent_workers=(self.num_workers > 0),
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
         )

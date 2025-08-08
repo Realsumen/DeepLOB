@@ -171,6 +171,9 @@ class DeepLOBLightning(pl.LightningModule):
             self.log("val_mse", mse, on_step=False, on_epoch=True, prog_bar=True)
             self.valid_preds.append(preds.detach().cpu())
             self.valid_labels.append(labels.detach().cpu())
+        
+        self.valid_preds.clear()
+        self.valid_labels.clear()
 
     def on_validation_epoch_end(self) -> None:
         all_preds = torch.cat(self.valid_preds, dim=0)
@@ -194,6 +197,7 @@ class DeepLOBLightning(pl.LightningModule):
             factor=0.5,
             patience=self.hparams.lr_reduce_patience,
             min_lr=1e-6,
+            verbose=True,
         )
         return {
             "optimizer": optimizer,

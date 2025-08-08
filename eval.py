@@ -24,10 +24,11 @@ def evaluate_model(
     else:
         raise RuntimeError("Invalid dataset")
 
+    model.eval()
     with torch.no_grad():
 
         for X, y in tqdm(dataloader):
-            X = X.to(device)
+            X = X.to(device, non_blocking=True)
             out = model(X)
             if task_type == "classification":
                 preds = out.argmax(dim=1).cpu()
