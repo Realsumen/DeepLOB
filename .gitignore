@@ -7,3 +7,6 @@ logs/
 checkpoints/
 
 data/
+
+.DS_Store
+

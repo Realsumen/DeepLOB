@@ -5,6 +5,8 @@ import torch.nn.functional as F
 class DeepLOBLightning(pl.LightningModule):
     def __init__(
         self,
+        rnn_type,
+        num_layers,
         input_width,
         input_size,
         in_channels,
@@ -15,6 +17,7 @@ class DeepLOBLightning(pl.LightningModule):
         neg_slope,
         hidden_size,
         lr_reduce_patience,
+        dropout_rate,
         task_type,
         monitor_metric,
         mode,
@@ -27,36 +30,78 @@ class DeepLOBLightning(pl.LightningModule):
 
         self.act = nn.LeakyReLU(self.hparams.neg_slope)
 
-        self.conv1 = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            stride=stride,
-        )  # -> (B,16,100,input_width // 2)
-        self.conv2 = nn.Conv2d(
-            out_channels, out_channels, kernel_size, stride=stride
-        )  # -> (B,16,100,input_width // 4)
-        self.conv3 = nn.Conv2d(
-            out_channels, out_channels, kernel_size=(1, self.hparams.input_width // 4)
-        )  # -> (B,16,100,1)
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(
+                in_channels=self.hparams.in_channels,
+                out_channels=self.hparams.out_channels,
+                kernel_size=self.hparams.kernel_size,
+                stride=self.hparams.stride,
+            ),
+            nn.BatchNorm2d(self.hparams.out_channels),
+            self.act,
+            nn.Dropout2d(dropout_rate),
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(
+                self.hparams.out_channels,
+                self.hparams.out_channels,
+                self.hparams.kernel_size,
+                stride=self.hparams.stride,
+            ),
+            nn.BatchNorm2d(self.hparams.out_channels),
+            self.act,
+            nn.Dropout2d(dropout_rate),
+        )
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(
+                self.hparams.out_channels,
+                self.hparams.out_channels,
+                kernel_size=(1, self.hparams.input_width // 4),
+            ),
+            nn.BatchNorm2d(self.hparams.out_channels),
+            self.act,
+            nn.Dropout2d(dropout_rate),
+        )
 
         # Inception 分支
-        def branch(k):  # k x 1 卷积分支
+        def branch(k):
             return nn.Sequential(
                 nn.Conv2d(16, 8, (1, 1)),
+                nn.BatchNorm2d(8),
                 nn.Conv2d(8, 8, (k, 1), padding="same"),
+                nn.BatchNorm2d(8),
                 self.act,
+                nn.Dropout2d(dropout_rate),
             )
 
-        self.branch1 = nn.Conv2d(16, 8, (1, 1))
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(16, 8, (1, 1)), nn.BatchNorm2d(8), self.act
+        )
         self.branch3, self.branch10, self.branch20 = branch(3), branch(10), branch(20)
         self.branchP = nn.Sequential(
-            nn.MaxPool2d((3, 1), 1, (1, 0)), nn.Conv2d(16, 8, (1, 1))
+            nn.MaxPool2d((3, 1), 1, (1, 0)),
+            nn.Conv2d(16, 8, (1, 1)),
+            nn.BatchNorm2d(8),
+            self.act,
         )
 
-        self.lstm = nn.LSTM(
-            input_size=input_size, hidden_size=hidden_size, batch_first=True
-        )
+        if self.hparams.rnn_type.lower() == "lstm":
+            self.rnn = nn.LSTM(
+                input_size=self.hparams.input_size,
+                hidden_size=self.hparams.hidden_size,
+                num_layers=self.hparams.num_layers,
+                batch_first=True,
+            )
+        elif self.hparams.rnn_type.lower() == "gru":
+            self.rnn = nn.GRU(
+                input_size=self.hparams.input_size,
+                hidden_size=self.hparams.hidden_size,
+                num_layers=self.hparams.num_layers,
+                batch_first=True,
+            )
+        else:
+            raise ValueError(f"Unknown rnn_type: {self.hparams.rnn_type}")
+        self.lstm_dropout = nn.Dropout(dropout_rate)
 
         if task_type == "classification":
             self.out_dim = 3
@@ -67,9 +112,10 @@ class DeepLOBLightning(pl.LightningModule):
         else:
             raise ValueError(f"Unknown task_type: {task_type}")
 
-        self.fc = nn.Linear(hidden_size, self.out_dim)
+        self.fc = nn.Sequential(
+            nn.Linear(self.hparams.hidden_size, self.out_dim), nn.Dropout(dropout_rate)
+        )
         self.apply(self._init_weights)
-        self.loss = nn.CrossEntropyLoss()
 
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv2d, nn.Linear)):
@@ -83,12 +129,12 @@ class DeepLOBLightning(pl.LightningModule):
 
     def forward(self, x):  # x (B,100,40)
         x = x.unsqueeze(1)  # -> (B,1,100,40)
-        x = self.act(self.conv1(x))
-        x = self.act(self.conv2(x))
-        x = self.act(self.conv3(x))  # (B,16,100,1)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)  # (B,16,100,1)
 
         B, C, T, W = x.shape  # W=1
-        b1 = self.act(self.branch1(x))
+        b1 = self.branch1(x)
         b3 = self.branch3(x)
         b10 = self.branch10(x)
         b20 = self.branch20(x)
@@ -96,8 +142,8 @@ class DeepLOBLightning(pl.LightningModule):
         x = torch.cat([b1, b3, b10, b20, bp], dim=1)  # (B,40,100,1)
         x = x.squeeze(-1).permute(0, 2, 1)  # (B,40,100)
 
-        lstm_out, _ = self.lstm(x)  # (100,B,64)
-        logits = self.fc(lstm_out[:, -1, :])  # (B, out_dim)
+        rnn_out, _ = self.rnn(x)  # (100,B,64)
+        logits = self.fc(rnn_out[:, -1, :])  # (B, out_dim)
         return logits
 
     def training_step(self, batch, batch_idx):
@@ -127,11 +173,11 @@ class DeepLOBLightning(pl.LightningModule):
             self.valid_labels.append(labels.detach().cpu())
 
     def on_validation_epoch_end(self) -> None:
-        all_preds  = torch.cat(self.valid_preds, dim=0)
+        all_preds = torch.cat(self.valid_preds, dim=0)
         all_labels = torch.cat(self.valid_labels, dim=0)
 
         nonzero = (all_preds != 0).sum().item()
-        total   = all_preds.numel()
+        total = all_preds.numel()
         print(f"[val epoch] non-zero preds = {nonzero}/{total}")
 
         ic = torch.corrcoef(torch.stack([all_preds, all_labels], dim=0))[0, 1]

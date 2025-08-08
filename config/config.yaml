@@ -1,57 +1,75 @@
 # config.yaml
 
-seed: 42
+seed: &seed 42
 
 data:
   path: "../data"
-  parquet_file: ["rb_20250605.parquet", "rb_20250606.parquet", "rb_20250609.parquet", "rb_20250610.parquet"]
-  seq_len: 100        # 用过去 100 行构造样本
-  horizon: 40         # 预测 40 行后
-  alpha: 1e-4         # 三分类阈值
-  multiplier: 1e4     # 回归放大标签值
+  parquet_file:
+    [
+      "rb_20250605.parquet",
+      "rb_20250606.parquet",
+      "rb_20250609.parquet",
+      "rb_20250610.parquet",
+    ]
+  seq_len: 100 # 用过去 100 行构造样本
+  horizon: 40 # 预测 40 行后
+  alpha: 1e-4 # 三分类阈值
+  multiplier: 1e4 # 回归放大标签值
   use_rolling_mean: False
+  perform_std: False
+  symbol_field: &symbol_field "instrumentID"
   feature_order:
-    - ask5
-    - askSize5
-    - ask4
-    - askSize4
-    - ask3
-    - askSize3
-    - ask2
-    - askSize2
     - ask1
     - askSize1
     - bid1
     - bidSize1
+
+    - ask2
+    - askSize2
     - bid2
     - bidSize2
+
+    - ask3
+    - askSize3
     - bid3
     - bidSize3
+
+    - ask4
+    - askSize4
     - bid4
     - bidSize4
+
+    - ask5
+    - askSize5
     - bid5
     - bidSize5
 
-datamodule:
-  batch_size: 1024
-  val_ratio: 0.1
-  num_workers: 4
-  random_split: True
-
 model:
-  task_type: "regression"   # classification or regression 
-  input_width: 20           # len(feature_order)
-  input_size: 40            # 5 Inception branches contribute to 40 features
+  rnn_type: "lstm"  # or "gru"
+  task_type: &task_type "regression" # classification or regression
+  num_layers: 4
+  input_width: 20 # len(feature_order)
+  input_size: 40 # 5 Inception branches contribute to 40 features
   in_channels: 1
   out_channels: 16
   kernel_size: [1, 2]
   stride: [1, 2]
-  lr: 1e-3
+  lr: 5e-4
   lr_reduce_patience: 4
   neg_slope: 0.01
+  dropout_rate: 0.2
   hidden_size: 516
   monitor_metric: "val_ic"
   mode: "max"
+
+datamodule:
+  symbol_field: *symbol_field
+  batch_size: 1024
+  val_ratio: 0.2
+  num_workers: 4
+  resplit_from_pool: True
+  seed: *seed
+  task_type: *task_type
 
 trainer:
   accelerator: "auto"

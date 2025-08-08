@@ -14,28 +14,27 @@ from model import *
 from utility import *
 from eval import *
 
+def _cast_sci(obj):
+    """
+    递归把符合科学计数法格式的 str 转为 float
+    """
+    _sci_re = re.compile(
+        r"""^[+-]?            # 可选正负号
+            (?:\d+\.\d*|\d*\.\d+|\d+)  # 整数或小数
+            [eE][+-]?\d+$    # e/E + 指数
+        """,
+        re.VERBOSE,
+    )
+
+    if isinstance(obj, dict):
+        return {k: _cast_sci(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_cast_sci(v) for v in obj]
+    if isinstance(obj, str) and _sci_re.match(obj):
+        return float(obj)
+    return obj
+
 def train():
-    def _cast_sci(obj):
-        """
-        递归把符合科学计数法格式的 str 转为 float
-        """
-        _sci_re = re.compile(
-            r"""^[+-]?            # 可选正负号
-                (?:\d+\.\d*|\d*\.\d+|\d+)  # 整数或小数
-                [eE][+-]?\d+$    # e/E + 指数
-            """,
-            re.VERBOSE,
-        )
-
-        if isinstance(obj, dict):
-            return {k: _cast_sci(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_cast_sci(v) for v in obj]
-        if isinstance(obj, str) and _sci_re.match(obj):
-            return float(obj)
-        return obj
-
-
     with open("config/config.yaml", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
@@ -60,8 +59,7 @@ def train():
         train_data=data[:-1],
         test_data=data[-1],
         dm_cfg=cfg["datamodule"],
-        data_cfg=cfg["data"],
-        task_type=model_cfg["task_type"],
+        data_cfg=cfg["data"]
     )
     dm.setup()
 
@@ -69,6 +67,8 @@ def train():
     mode = model_cfg["mode"]
 
     model = DeepLOBLightning(
+        rnn_type=model_cfg["rnn_type"],
+        num_layers=model_cfg["num_layers"],
         input_width=model_cfg["input_width"],
         input_size=model_cfg["input_size"],
         in_channels=model_cfg["in_channels"],
@@ -80,8 +80,9 @@ def train():
         hidden_size=model_cfg["hidden_size"],
         lr_reduce_patience=model_cfg["lr_reduce_patience"],
         task_type=model_cfg["task_type"],
+        dropout_rate=model_cfg["dropout_rate"],
         monitor_metric=monitor_metric,
-        mode=mode,
+        mode=mode
     )
 
     checkpoint_callback = ModelCheckpoint(
@@ -111,9 +112,10 @@ def train():
         callbacks=[checkpoint_callback, early_stop_callback],
         logger=logger,
         log_every_n_steps=trainer_cfg["log_every_n_steps"],
-    )
 
+    )
     trainer.fit(model, dm)
 
 if __name__ == "__main__":
     train()
+    

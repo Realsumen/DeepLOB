@@ -36,7 +36,7 @@ def evaluate_model(
                 preds = out.squeeze(-1).cpu()        # (B,)
                 labels = y.float() 
             all_preds.append(preds)
-            all_labels.append(y)
+            all_labels.append(labels)
 
     preds = torch.cat(all_preds).numpy()
     labels = torch.cat(all_labels).numpy()
